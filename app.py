@@ -87,7 +87,7 @@ with st.sidebar:
     st.markdown("##### ⚙️ Size Filter Configuration")
     min_size_kb = st.number_input("Minimum Image Size Filter (KB):", min_value=0, value=50, step=50)
     st.write("---")
-    st.caption("Recommended: Run in batches of 10-20 loans for best performance.")
+    st.caption("Recommended: Run in batches of maximum 100 loans for best performance.")
 
 st.markdown("## 📸 TVS Credit Vehicle Image Scraper Tool")
 st.markdown("""
