@@ -8,30 +8,23 @@ import zipfile
 import pandas as pd
 import requests
 import fitz  # PyMuPDF
-from flask import Flask, render_template, request
-from werkzeug.utils import secure_filename
+import streamlit as st
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from pdf2image import convert_from_bytes, convert_from_path
 
-# --- SELENIUM INFRASTRUCTURE CONTROLLERS ---
+# --- SELENIUM REQUISITES ---
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
-app = Flask(__name__)
 
 # ==========================================
 # ⚙️ CONFIGURATION SYSTEM GLOBAL PARAMETERS
 # ==========================================
-UPLOAD_FOLDER = 'uploads'
 OUTPUT_BASE_FOLDER = 'Unified_Inspection_Downloads'
-POPPLER_PATH = r"D:\HTML Data\Other\Tool\Mercedes_autoinspect\Mercedes_autoinspect\poppler-25.11.0\Library\bin"
-SELENIUM_WAIT_TIME = 12
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_BASE_FOLDER, exist_ok=True)
 
 HEADERS = {
@@ -59,32 +52,23 @@ def smart_get(url, retries=3):
             time.sleep(1.0)
     return None, retries
 
-def get_next_z_number(folder):
-    existing = [f for f in os.listdir(folder) if f.lower().startswith("z") and f.lower().endswith(".jpg")]
-    if not existing: return 1
-    numbers = [int(n) for f in existing for n in re.findall(r'\d+', f)]
-    return max(numbers) + 1 if numbers else 1
-
 def process_pdf_bytes_to_images(content, folder):
     try:
-        images = convert_from_bytes(content, poppler_path=POPPLER_PATH, dpi=200)
-        z_counter = get_next_z_number(folder)
-        for image in images:
-            filename = f"Z{str(z_counter).zfill(3)}.jpg"
+        # On Streamlit Cloud, poppler is installed globally via packages.txt, no path needed
+        images = convert_from_bytes(content, dpi=200)
+        for i, image in enumerate(images):
+            filename = f"Z{str(i+1).zfill(3)}.jpg"
             image.save(os.path.join(folder, filename), "JPEG")
-            z_counter += 1
         return "Success"
     except Exception as e:
         return f"Error: {str(e)}"
 
 def process_pdf_path_to_images(pdf_path, folder):
     try:
-        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH, dpi=200)
-        z_counter = get_next_z_number(folder)
-        for image in images:
-            filename = f"Z{str(z_counter).zfill(3)}.jpg"
+        images = convert_from_path(pdf_path, dpi=200)
+        for i, image in enumerate(images):
+            filename = f"Z{str(i+1).zfill(3)}.jpg"
             image.save(os.path.join(folder, filename), "JPEG")
-            z_counter += 1
         return "Success"
     except Exception as e:
         return f"Error: {str(e)}"
@@ -104,20 +88,35 @@ def extract_all_zips(folder):
                 except Exception:
                     pass
 
+def wait_for_selenium_files(download_dir, before_files, timeout=12):
+    start = time.time()
+    while time.time() - start < timeout:
+        current_files = set(os.listdir(download_dir))
+        new_files = current_files - before_files
+        if new_files:
+            if any(f.endswith(".crdownload") or f.endswith(".tmp") for f in current_files):
+                time.sleep(0.5)
+                continue
+            valid_files = {f for f in new_files if not f.endswith(".crdownload") and not f.endswith(".tmp")}
+            if valid_files:
+                time.sleep(0.5)
+                return valid_files
+        time.sleep(0.5)
+    return set()
+
 # ==========================================
-# 🎛️ CORE ROUTING & LOGICAL CHANNELS
+# 🔀 ENGINE DOWNSTREAM PIPELINES
 # ==========================================
 
 def execute_autoinspekt_pipeline(link, car_folder, status_entry):
     parts = link.split("/")
     encoded_id = parts[5] if len(parts) > 5 else None
     if not encoded_id:
-        status_entry["Pipeline Channel"] = "AutoInspekt (Invalid Token Mapping ID)"
+        status_entry["Pipeline Channel"] = "AutoInspekt (Invalid Link Structure)"
         return
     
     status_entry["Pipeline Channel"] = "AutoInspekt Engine"
     pdf_res, attempts = smart_get(link)
-    status_entry["Attempts"] = attempts
     if pdf_res:
         status_entry["PDF Outcome"] = process_pdf_bytes_to_images(pdf_res.content, car_folder)
 
@@ -165,44 +164,34 @@ def execute_tvs_credit_pipeline(row, link_columns, car_folder, status_entry):
                             f.write(img_res.content)
                         success_downloads += 1
                         log_details.append(f"[{col}]: Success")
-                    else: log_details.append(f"[{col}]: Binary Fetch Error")
-                else: log_details.append(f"[{col}]: imgDisplay tag missing")
-            else: log_details.append(f"[{col}]: HTTP Page Failure {res.status_code}")
+                    else: log_details.append(f"[{col}]: Download Error")
+                else: log_details.append(f"[{col}]: Missing imgDisplay Element")
+            else: log_details.append(f"[{col}]: HTTP Error {res.status_code}")
         except Exception as e:
-            log_details.append(f"[{col}]: Failure ({str(e)})")
+            log_details.append(f"[{col}]: Failed ({str(e)})")
             
-    status_entry["PDF Outcome"] = f"Downloaded {success_downloads} explicit web assets"
+    status_entry["PDF Outcome"] = f"Extracted {success_downloads} Web Assets"
     status_entry["ZIP Outcome"] = "N/A"
     status_entry["Pipeline Log Summary"] = " | ".join(log_details)
 
-def wait_for_selenium_files(download_dir, before_files, timeout=SELENIUM_WAIT_TIME):
-    start = time.time()
-    while time.time() - start < timeout:
-        current_files = set(os.listdir(download_dir))
-        new_files = current_files - before_files
-        if new_files:
-            if any(f.endswith(".crdownload") or f.endswith(".tmp") for f in current_files):
-                time.sleep(0.5)
-                continue
-            valid_files = {f for f in new_files if not f.endswith(".crdownload") and not f.endswith(".tmp")}
-            if valid_files:
-                time.sleep(0.5)
-                return valid_files
-        time.sleep(0.5)
-    return set()
-
-def execute_selenium_headless_pipeline(link, file_name, car_folder, run_path, status_entry):
+def execute_selenium_headless_pipeline(link, file_name, car_folder, status_entry):
     status_entry["Pipeline Channel"] = "Selenium Headless Browser Engine"
     
     options = Options()
-    options.add_experimental_option("prefs", {
-        "download.default_directory": os.path.abspath(car_folder),
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True
-    })
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    
+    # Secure execution preferences assigned explicitly to targeted workspace directories
+    prefs = {
+        "download.default_directory": os.path.abspath(car_folder),
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "plugins.always_open_pdf_externally": True  # Force download instead of opening inside driver
+    }
+    options.add_experimental_option("prefs", prefs)
     
     driver = webdriver.Chrome(options=options)
     try:
@@ -210,7 +199,6 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, run_path, st
         driver.get(link)
         new_files = wait_for_selenium_files(car_folder, before_files)
         
-        # Branch directly if a target file payload drops instantly
         if new_files:
             for file in new_files:
                 src_path = os.path.join(car_folder, file)
@@ -220,7 +208,7 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, run_path, st
                 shutil.move(src_path, dest_path)
                 
                 if standardized_name.lower().endswith(".pdf"):
-                    # Scan internal page structures via PyMuPDF vector extraction maps
+                    # Scan internal page structures via PyMuPDF vector mapping
                     doc = fitz.open(dest_path)
                     download_url = None
                     for page in doc:
@@ -237,7 +225,6 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, run_path, st
                         driver.get(download_url)
                         wait_for_selenium_files(car_folder, before_zip)
                     else:
-                        # Falling back directly onto visible page container elements
                         driver.get(link)
                         try:
                             btn = WebDriverWait(driver, 5).until(
@@ -252,9 +239,9 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, run_path, st
                     os.remove(dest_path)
                 
             extract_all_zips(car_folder)
-            status_entry["ZIP Outcome"] = "Success (Extracted Framework Assets)"
+            status_entry["ZIP Outcome"] = "Success"
         else:
-            # Fallback workflow directly executing from base valuation domain landing maps
+            # Interactive webpage tracking mode block
             driver.get(link)
             try:
                 btn = WebDriverWait(driver, 5).until(
@@ -262,7 +249,7 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, run_path, st
                 )
                 before_zip = set(os.listdir(car_folder))
                 btn.click()
-                downloaded = wait_for_selenium_files(car_folder, before_zip)
+                wait_for_selenium_files(car_folder, before_zip)
                 extract_all_zips(car_folder)
                 
                 for file in os.listdir(car_folder):
@@ -274,85 +261,107 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, run_path, st
                 status_entry["ZIP Outcome"] = "Success (Web Extracted)"
             except Exception as inner:
                 status_entry["PDF Outcome"] = "Failed"
-                status_entry["ZIP Outcome"] = f"No interactive triggers captured: {str(inner)}"
+                status_entry["ZIP Outcome"] = f"No Interactive Triggers Found: {str(inner)}"
     except Exception as outer:
         status_entry["PDF Outcome"] = "Crash"
-        status_entry["ZIP Outcome"] = f"Selenium Pipeline Error: {str(outer)}"
+        status_entry["ZIP Outcome"] = f"Selenium Error: {str(outer)}"
     finally:
         driver.quit()
 
 # ==========================================
-# 📊 CONTROL INTERFACE ENDPOINTS
+# 📊 STREAMLIT CORE APPLICATION FRONTEND
 # ==========================================
+st.set_page_config(page_title="Unified Inspection Tool", page_icon="📸", layout="wide")
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+st.markdown("## 📸 Unified Vehicle Inspection Downloader Engine")
+st.caption("Supports AutoInspekt, TVS Credit/Adroit DOM Links, and Headless Bajaj Finserv Automated Portals.")
+st.write("---")
 
-@app.route('/upload', methods=['POST'])
-def upload_file_web():
-    file = request.files.get('excel_file')
-    if not file: return "No file selected."
+uploaded_file = st.file_uploader("Upload your Master Tracking Sheet (.xlsx)", type=["xlsx"])
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_folder_name = f"Unified_Run_{timestamp}"
-    run_path = os.path.join(OUTPUT_BASE_FOLDER, run_folder_name)
-    os.makedirs(run_path, exist_ok=True)
-
-    excel_path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
-    file.save(excel_path)
-
-    df = pd.read_excel(excel_path)
-    report_data = []
-
-    # Map target rows gracefully across any custom layout variations
+if uploaded_file is not None:
+    df = pd.read_excel(uploaded_file)
+    st.markdown("### 🔍 Uploaded Data Ingestion Preview")
+    st.dataframe(df.head(5), use_container_width=True)
+    
+    # Map layout arrays across column variances
     cols_upper = [str(c).upper() for c in df.columns]
-    name_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["FILE NAME", "CAR/FILE NAME", "AGREEMENT NO", "LOAN NO"]), "File Name")
-    link_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["LINK", "INPUT LINK"]), "Link")
-    link_columns = [col for col in df.columns if col != name_col and str(col).upper() not in ["AUCTION ID", "SR NO", "SRNO", link_col.upper()]]
+    name_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["FILE NAME", "CAR/FILE NAME", "AGREEMENT NO", "LOAN NO"]), None)
+    link_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["LINK", "INPUT LINK"]), None)
+    link_columns = [col for col in df.columns if col != name_col and str(col).upper() not in ["AUCTION ID", "SR NO", "SRNO", str(link_col).upper()]]
 
-    for index, row in df.iterrows():
-        raw_name = row.get(name_col, f"Item_{index}")
-        if pd.isna(raw_name): continue
-        
-        file_name = sanitize_filename(str(raw_name))
-        primary_link = str(row.get(link_col, "")).strip()
-        
-        status_entry = {
-            "Car/File Name": file_name,
-            "Pipeline Channel": "Unknown",
-            "PDF Outcome": "N/A",
-            "ZIP Outcome": "N/A",
-            "Attempts": 1,
-            "Pipeline Log Summary": "Execution Completed",
-            "Processed At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        car_folder = os.path.join(run_path, file_name)
-        os.makedirs(car_folder, exist_ok=True)
-        
-        # 🔀 ARCHITECTURE PLATFORM DYNAMIC ROUTING TREE
-        if "autoinspekt.com" in primary_link:
-            execute_autoinspekt_pipeline(primary_link, car_folder, status_entry)
+    if not name_col or not link_col:
+        st.error("❌ Column Mapping Gaps Found. Ensure sheet includes tracking identifiers ('File Name' / 'Agreement No') and URI references ('Link').")
+    else:
+        if st.button("🚀 Start Unified Processing Pipeline", type="primary", use_container_width=True):
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_folder_name = f"Unified_Run_{timestamp}"
+            run_path = os.path.join(OUTPUT_BASE_FOLDER, run_folder_name)
+            os.makedirs(run_path, exist_ok=True)
             
-        elif "adroitauto.in" in primary_link or any(str(row.get(c, "")).startswith("http") for c in link_columns):
-            # Fallback path executing explicit DOM scraping if landing links maps onto TVS profiles
-            execute_tvs_credit_pipeline(row, link_columns, car_folder, status_entry)
+            report_data = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            total_rows = len(df)
+
+            for index, row in df.iterrows():
+                raw_name = row.get(name_col, f"Item_{index}")
+                if pd.isna(raw_name): continue
+                
+                file_name = sanitize_filename(str(raw_name))
+                primary_link = str(row.get(link_col, "")).strip()
+                
+                status_text.markdown(f"**🔄 Processing Row ({index+1}/{total_rows}):** `{file_name}`")
+                
+                status_entry = {
+                    "Car/File Name": file_name,
+                    "Pipeline Channel": "Unknown",
+                    "PDF Outcome": "N/A",
+                    "ZIP Outcome": "N/A",
+                    "Pipeline Log Summary": "Execution Completed",
+                    "Processed At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                car_folder = os.path.join(run_path, file_name)
+                os.makedirs(car_folder, exist_ok=True)
+                
+                # 🔀 STRATEGIC ROUTING MATRIX
+                if "autoinspekt.com" in primary_link:
+                    execute_autoinspekt_pipeline(primary_link, car_folder, status_entry)
+                elif "adroitauto.in" in primary_link or any(str(row.get(c, "")).startswith("http") for c in link_columns):
+                    execute_tvs_credit_pipeline(row, link_columns, car_folder, status_entry)
+                elif primary_link.startswith("http"):
+                    execute_selenium_headless_pipeline(primary_link, file_name, car_folder, status_entry)
+                else:
+                    status_entry["Pipeline Log Summary"] = "Skipped: Missing hypermedia pathway map"
+
+                report_data.append(status_entry)
+                progress_bar.progress((index + 1) / total_rows)
+
+            status_text.success("🏁 Pipeline Processing Run Completed Successfully!")
             
-        elif primary_link.startswith("http"):
-            # Triggering headless automated worker browsers for Bajaj Finserv / Adroit secure sessions
-            execute_selenium_headless_pipeline(primary_link, file_name, car_folder, run_path, status_entry)
+            # Save the execution evaluation ledger workbook
+            report_df = pd.DataFrame(report_data)
+            report_excel_path = os.path.join(run_path, f"Global_Completion_Report_{timestamp}.xlsx")
+            report_df.to_excel(report_excel_path, index=False)
             
-        else:
-            status_entry["Pipeline Log Summary"] = "Skipped: Invalid or empty URI link path parameters."
-
-        report_data.append(status_entry)
-
-    if report_data:
-        report_df = pd.DataFrame(report_data)
-        report_df.to_excel(os.path.join(run_path, f"Global_Completion_Report_{timestamp}.xlsx"), index=False)
-
-    return render_template('index.html', finished=True, run_id=run_folder_name, folder=os.path.abspath(run_path))
-
-if __name__ == '__main__':
-    app.run(debug=True)
+            # Compress all generated subfolders safely in memory to yield one target download ZIP
+            st.markdown("### 📥 Download Processed Deliverables")
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(run_path):
+                    for file in files:
+                        fp = os.path.join(root, file)
+                        rel_p = os.path.relpath(fp, run_path)
+                        zf.write(fp, rel_p)
+            
+            st.download_button(
+                label="📥 DOWNLOAD ZIP ARCHIVE WITH COMPLETION REPORT",
+                data=zip_buffer.getvalue(),
+                file_name=f"Unified_Inspection_Package_{timestamp}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+            
+            # Clean workspace directories locally on server container to prevent leakage boundaries
+            shutil.rmtree(run_path)
