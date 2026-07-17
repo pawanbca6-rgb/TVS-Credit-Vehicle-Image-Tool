@@ -1,358 +1,367 @@
+import streamlit as st
+import time
 import os
 import re
-import io
-import time
-import datetime
-import shutil
-import zipfile
-import pandas as pd
 import requests
-import fitz  # Provided cleanly by PyMuPDF
-import streamlit as st
+import pandas as pd
+import hashlib
+import gc
+import zipfile
+import io
+from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from pdf2image import convert_from_bytes, convert_from_path
+from PIL import Image as PILImage, ImageOps
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- SELENIUM REQUISITES ---
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+# --- STATE INITIALIZATION ---
+if "processing_complete" not in st.session_state:
+    st.session_state.processing_complete = False
+if "zip_name" not in st.session_state:
+    st.session_state.zip_name = ""
+if "total_extracted" not in st.session_state:
+    st.session_state.total_extracted = 0
+if "success_count" not in st.session_state:
+    st.session_state.success_count = 0
+if "failure_count" not in st.session_state:
+    st.session_state.failure_count = 0
+if "final_df_summary" not in st.session_state:
+    st.session_state.final_df_summary = None
 
-# ==========================================
-# ⚙️ CONFIGURATION SYSTEM GLOBAL PARAMETERS
-# ==========================================
-OUTPUT_BASE_FOLDER = 'Unified_Inspection_Downloads'
-os.makedirs(OUTPUT_BASE_FOLDER, exist_ok=True)
+# --- UI CONFIGURATION ---
+st.set_page_config(
+    page_title="TVS Credit Image Tool", 
+    page_icon="📸",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-}
-http_session = requests.Session()
-http_session.headers.update(HEADERS)
-
-# ==========================================
-# 🛠️ GLOBAL SHARED PIPELINE UTILITIES
-# ==========================================
-
-def sanitize_filename(name):
-    return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip()
-
-def smart_get(url, retries=3):
-    for i in range(1, retries + 1):
-        try:
-            response = http_session.get(url, timeout=30)
-            if response.status_code == 200:
-                return response, i
-        except Exception:
-            pass
-        if i < retries:
-            time.sleep(1.0)
-    return None, retries
-
-def process_pdf_bytes_to_images(content, folder):
-    try:
-        images = convert_from_bytes(content, dpi=200)
-        for i, image in enumerate(images):
-            filename = f"Z{str(i+1).zfill(3)}.jpg"
-            image.save(os.path.join(folder, filename), "JPEG")
-        return "Success"
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-def process_pdf_path_to_images(pdf_path, folder):
-    try:
-        images = convert_from_path(pdf_path, dpi=200)
-        for i, image in enumerate(images):
-            filename = f"Z{str(i+1).zfill(3)}.jpg"
-            image.save(os.path.join(folder, filename), "JPEG")
-        return "Success"
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-def extract_all_zips(folder):
-    extracting = True
-    while extracting:
-        extracting = False
-        for file in os.listdir(folder):
-            if file.endswith(".zip"):
-                zip_path = os.path.join(folder, file)
-                try:
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall(folder)
-                    os.remove(zip_path)
-                    extracting = True
-                except Exception:
-                    pass
-
-def wait_for_selenium_files(download_dir, before_files, timeout=12):
-    start = time.time()
-    while time.time() - start < timeout:
-        current_files = set(os.listdir(download_dir))
-        new_files = current_files - before_files
-        if new_files:
-            if any(f.endswith(".crdownload") or f.endswith(".tmp") for f in current_files):
-                time.sleep(0.5)
-                continue
-            valid_files = {f for f in new_files if not f.endswith(".crdownload") and not f.endswith(".tmp")}
-            if valid_files:
-                time.sleep(0.5)
-                return valid_files
-        time.sleep(0.5)
-    return set()
-
-# ==========================================
-# 🔀 ENGINE DOWNSTREAM PIPELINES
-# ==========================================
-
-def execute_autoinspekt_pipeline(link, car_folder, status_entry):
-    parts = link.split("/")
-    encoded_id = parts[5] if len(parts) > 5 else None
-    if not encoded_id:
-        status_entry["Pipeline Channel"] = "AutoInspekt (Invalid Link Structure)"
-        return
+st.markdown("""
+    <style>
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] { gap: 0.5rem !important; }
+    section[data-testid="stSidebar"] { overflow-y: hidden !important; overflow-x: hidden !important; }
+    .main-header { font-size: 34px; font-weight: 800; color: #1E3A8A; margin-bottom: 2px; }
+    .metric-box { background-color: #F3F4F6; padding: 18px; border-radius: 10px; border-left: 6px solid #1E40AF; box-shadow: 0 2px 4px rgba(0,0,0,0.04); }
+    .footer-text { text-align: center; font-size: 14px; color: #9CA3AF; margin-top: 50px; padding-top: 20px; border-top: 1px solid #E5E7EB; }
+    .note-box { background-color: #EFF6FF; color: #1E40AF; padding: 12px; border-radius: 6px; border-left: 4px solid #2563EB; margin-bottom: 15px; font-size: 14px; font-weight: 500; }
+    .premium-card { background: #FFFFFF; padding: 24px; border-radius: 14px; border-bottom: 5px solid #CBD5E1; box-shadow: 0 4px 20px rgba(0,0,0,0.03); text-align: center; transition: transform 0.2s; }
+    .premium-card:hover { transform: translateY(-2px); }
+    .card-title { font-size: 12px; color: #64748B; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+    .card-value { font-size: 38px; font-weight: 800; margin-top: 8px; }
     
-    status_entry["Pipeline Channel"] = "AutoInspekt Engine"
-    pdf_res, attempts = smart_get(link)
-    if pdf_res:
-        status_entry["PDF Outcome"] = process_pdf_bytes_to_images(pdf_res.content, car_folder)
-
-    zip_link = f"https://aiv2client.autoinspekt.com/download/LeadImages/{encoded_id}"
-    zip_res, _ = smart_get(zip_link)
-    if zip_res:
-        rename_map = {"front": "1_front", "left": "2_left", "right": "3_Right", "rear": "4_Rear"}
-        try:
-            with zipfile.ZipFile(io.BytesIO(zip_res.content)) as zip_ref:
-                for file in zip_ref.namelist():
-                    if file.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                        orig_name = os.path.basename(file)
-                        if not orig_name: continue
-                        new_name = orig_name.replace(" ", "_")
-                        for key, val in rename_map.items():
-                            if key.lower() in new_name.lower():
-                                new_name = re.compile(re.escape(key), re.IGNORECASE).sub(val, new_name)
-                                break
-                        with open(os.path.join(car_folder, new_name), "wb") as f:
-                            f.write(zip_ref.read(file))
-            status_entry["ZIP Outcome"] = "Success"
-        except Exception as e:
-            status_entry["ZIP Outcome"] = f"Error: {str(e)}"
-
-def execute_tvs_credit_pipeline(row, link_columns, car_folder, status_entry):
-    status_entry["Pipeline Channel"] = "TVS Credit / Adroit DOM Parser"
-    log_details = []
-    success_downloads = 0
-    
-    for col in link_columns:
-        webpage_url = str(row.get(col, "")).strip()
-        if not webpage_url or webpage_url == "nan" or not webpage_url.startswith("http"):
-            continue
-        try:
-            res = http_session.get(webpage_url, timeout=15)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                img_tag = soup.find('img', id='imgDisplay')
-                if img_tag and img_tag.get('src'):
-                    full_img_url = urljoin(webpage_url, img_tag.get('src'))
-                    img_res = http_session.get(full_img_url, timeout=15)
-                    if img_res.status_code == 200:
-                        clean_col = re.sub(r'[^a-zA-Z0-9_]', '', str(col).replace(" ", "_"))
-                        with open(os.path.join(car_folder, f"{clean_col}.jpg"), 'wb') as f:
-                            f.write(img_res.content)
-                        success_downloads += 1
-                        log_details.append(f"[{col}]: Success")
-                    else: log_details.append(f"[{col}]: Download Error")
-                else: log_details.append(f"[{col}]: Missing imgDisplay Element")
-            else: log_details.append(f"[{col}]: HTTP Error {res.status_code}")
-        except Exception as e:
-            log_details.append(f"[{col}]: Failed ({str(e)})")
-            
-    status_entry["PDF Outcome"] = f"Extracted {success_downloads} Web Assets"
-    status_entry["ZIP Outcome"] = "N/A"
-    status_entry["Pipeline Log Summary"] = " | ".join(log_details)
-
-def execute_selenium_headless_pipeline(link, file_name, car_folder, status_entry):
-    status_entry["Pipeline Channel"] = "Selenium Headless Browser Engine"
-    
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    
-    prefs = {
-        "download.default_directory": os.path.abspath(car_folder),
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "plugins.always_open_pdf_externally": True
+    div[data-testid="stFileUploaderDropzoneInstructions"] small,
+    div[data-testid="stFileUploaderDropzoneInstructions"] div,
+    div[data-testid="stWidgetFormInstructions"],
+    .stWidgetFormInstructions { display: none !important; }
+    div[data-testid="stFileUploaderDropzoneInstructions"]::after {
+        content: "⚠️ Please upload valid Excel (.xlsx) file";
+        font-size: 13px; color: #DC2626; font-weight: 600; display: block; margin-top: 12px; text-align: center;
     }
-    options.add_experimental_option("prefs", prefs)
+    </style>
+""", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.markdown("### 🎛️ Control & Template Center")
+    st.write("---")
     
-    driver = webdriver.Chrome(options=options)
-    try:
-        before_files = set(os.listdir(car_folder))
-        driver.get(link)
-        new_files = wait_for_selenium_files(car_folder, before_files)
-        
-        if new_files:
-            for file in new_files:
-                src_path = os.path.join(car_folder, file)
-                ext = os.path.splitext(file)[1]
-                standardized_name = f"{file_name}{ext}"
-                dest_path = os.path.join(car_folder, standardized_name)
-                shutil.move(src_path, dest_path)
-                
-                if standardized_name.lower().endswith(".pdf"):
-                    doc = fitz.open(dest_path)
-                    download_url = None
-                    for page in doc:
-                        for link_dict in page.get_links():
-                            uri = link_dict.get("uri", "")
-                            if uri and "action=download_case_images" in uri:
-                                download_url = uri
-                                break
-                        if download_url: break
-                    doc.close()
-                    
-                    if download_url:
-                        before_zip = set(os.listdir(car_folder))
-                        driver.get(download_url)
-                        wait_for_selenium_files(car_folder, before_zip)
-                    else:
-                        driver.get(link)
-                        try:
-                            btn = WebDriverWait(driver, 5).until(
-                                EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Download Images')]"))
-                            )
-                            before_zip = set(os.listdir(car_folder))
-                            btn.click()
-                            wait_for_selenium_files(car_folder, before_zip)
-                        except Exception: pass
-                    
-                    status_entry["PDF Outcome"] = process_pdf_path_to_images(dest_path, car_folder)
-                    os.remove(dest_path)
-                
-            extract_all_zips(car_folder)
-            status_entry["ZIP Outcome"] = "Success"
-        else:
-            driver.get(link)
-            try:
-                btn = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Download Images')]"))
-                )
-                before_zip = set(os.listdir(car_folder))
-                btn.click()
-                wait_for_selenium_files(car_folder, before_zip)
-                extract_all_zips(car_folder)
-                
-                for file in os.listdir(car_folder):
-                    if file.lower().endswith(".pdf"):
-                        p_path = os.path.join(car_folder, file)
-                        process_pdf_path_to_images(p_path, car_folder)
-                        os.remove(p_path)
-                status_entry["PDF Outcome"] = "Success (Web Fallback)"
-                status_entry["ZIP Outcome"] = "Success (Web Extracted)"
-            except Exception as inner:
-                status_entry["PDF Outcome"] = "Failed"
-                status_entry["ZIP Outcome"] = f"No Interactive Triggers Found: {str(inner)}"
-    except Exception as outer:
-        status_entry["PDF Outcome"] = "Crash"
-        status_entry["ZIP Outcome"] = f"Selenium Error: {str(outer)}"
-    finally:
-        driver.quit()
+    sample_data = {
+        "AGREEMENT NO": ["TN3006CA0024047", "TN3006TW0162293"],
+        "REPO FRONT": ["https://icms.tvscredit.com/...", "https://icms.tvscredit.com/..."],
+        "REPO REAR": ["https://icms.tvscredit.com/...", "https://icms.tvscredit.com/..."]
+    }
+    sample_df = pd.DataFrame(sample_data)
+    
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        sample_df.to_excel(writer, index=False, sheet_name='Sheet1')
+    
+    st.download_button(
+        label="📥 Download TVS Excel Template",
+        data=buffer.getvalue(),
+        file_name="tvs_input_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+    st.write("---")
+    
+    st.markdown("##### ⚙️ Size Filter Configuration")
+    min_size_kb = st.number_input("Minimum Image Size Filter (KB):", min_value=0, value=50, step=50)
+    st.write("---")
+    st.caption("Recommended: Run in batches of maximum 100 loans for best performance.")
 
-# ==========================================
-# 📊 STREAMLIT CORE APPLICATION FRONTEND
-# ==========================================
-st.set_page_config(page_title="Unified Inspection Tool", page_icon="📸", layout="wide")
+st.markdown("## 📸 TVS Credit Vehicle Image Scraper Tool")
+st.markdown("""
+    <div class="note-box">
+        📌 <strong>This Tool extracts and categorizes dynamic vehicle images using secure scraping pathways.</strong>
+    </div>
+""", unsafe_allow_html=True)
 
-st.markdown("## 📸 Unified Vehicle Inspection Downloader Engine")
-st.caption("Supports AutoInspekt, TVS Credit/Adroit DOM Links, and Headless Bajaj Finserv Automated Portals.")
-st.write("---")
+layout_left, layout_right = st.columns([2, 1])
 
-uploaded_file = st.file_uploader("Upload your Master Tracking Sheet (.xlsx)", type=["xlsx"])
+with layout_left:
+    st.markdown("### 📂 File Upload")
+    uploaded_file = st.file_uploader("Drop xlsx file here", type=["xlsx"], label_visibility="collapsed")
+
+# --- DATASET VALIDATION ---
+valid_rows = []
+total_loans_count = 0
+link_columns = []
 
 if uploaded_file is not None:
     df = pd.read_excel(uploaded_file)
-    st.markdown("### 🔍 Uploaded Data Ingestion Preview")
-    st.dataframe(df.head(5), use_container_width=True)
+    # Check flexible naming variations
+    agreement_col = next((c for c in df.columns if c.upper() in ["AGREEMENT NO", "AGREEMENTNO", "LOAN NO"]), None)
     
-    cols_upper = [str(c).upper() for c in df.columns]
-    name_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["FILE NAME", "CAR/FILE NAME", "AGREEMENT NO", "LOAN NO"]), None)
-    link_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["LINK", "INPUT LINK"]), None)
-    link_columns = [col for col in df.columns if col != name_col and str(col).upper() not in ["AUCTION ID", "SR NO", "SRNO", str(link_col).upper()]]
-
-    if not name_col or not link_col:
-        st.error("❌ Column Mapping Gaps Found. Ensure sheet includes tracking identifiers ('File Name' / 'Agreement No') and URI references ('Link').")
+    if not agreement_col:
+        st.error("❌ Column Validation Error: Sheet inside uploaded file must contain 'AGREEMENT NO' track header.")
     else:
-        if st.button("🚀 Start Unified Processing Pipeline", type="primary", use_container_width=True):
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_folder_name = f"Unified_Run_{timestamp}"
-            run_path = os.path.join(OUTPUT_BASE_FOLDER, run_folder_name)
-            os.makedirs(run_path, exist_ok=True)
-            
-            report_data = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            total_rows = len(df)
+        valid_rows = df[df[agreement_col].notna()]
+        total_loans_count = len(valid_rows)
+        link_columns = [col for col in df.columns if col != agreement_col and col.upper() != "AUCTION ID"]
+        
+        with layout_left:
+            st.markdown("### 🔍 Input Preview")
+            preview_df = df.copy()
+            preview_df.index = preview_df.index + 1
+            st.dataframe(preview_df, use_container_width=True, height=180)
+        
+        with layout_right:
+            st.markdown("### 📊 Queue Status")
+            st.markdown(f"""
+                <div class="metric-box">
+                    <span style='font-size:13px; color:#6B7280; text-transform: uppercase; font-weight:bold;'>Total Loans Queue</span><br>
+                    <span style='font-size:32px; font-weight:bold; color:#1E40AF;'>{total_loans_count}</span>
+                </div>
+            """, unsafe_allow_html=True)
 
-            for index, row in df.iterrows():
-                raw_name = row.get(name_col, f"Item_{index}")
-                if pd.isna(raw_name): continue
-                
-                file_name = sanitize_filename(str(raw_name))
-                primary_link = str(row.get(link_col, "")).strip()
-                
-                status_text.markdown(f"**🔄 Processing Row ({index+1}/{total_rows}):** `{file_name}`")
-                
-                status_entry = {
-                    "Car/File Name": file_name,
-                    "Pipeline Channel": "Unknown",
-                    "PDF Outcome": "N/A",
-                    "ZIP Outcome": "N/A",
-                    "Pipeline Log Summary": "Execution Completed",
-                    "Processed At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+with st.sidebar:
+    st.write(" ")
+    run_engine = st.button(
+        "🚀 Start Downloading", 
+        type="primary", 
+        use_container_width=True,
+        disabled=(uploaded_file is None)
+    )
+
+# --- CORE PARSING & PIPELINE FUNCTIONS ---
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+def get_real_image_url(webpage_url, session):
+    try:
+        response = session.get(webpage_url, headers=HEADERS, timeout=12)
+        if response.status_code != 200:
+            return None, f"HTTP Status {response.status_code}"
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        img_tag = soup.find('img', id='imgDisplay')
+        
+        if img_tag and img_tag.get('src'):
+            src = img_tag.get('src')
+            full_img_url = urljoin(webpage_url, src)
+            return full_img_url, "Success"
+        return None, "Secure tag 'imgDisplay' not found"
+    except Exception as e:
+        return None, str(e)
+
+def download_and_verify(img_url, save_path, session, min_kb):
+    try:
+        r = session.get(img_url, headers=HEADERS, stream=True, timeout=15)
+        if r.status_code == 200:
+            content_length = r.headers.get('content-length')
+            if content_length:
+                size_kb = int(content_length) / 1024
+                if size_kb < min_kb:
+                    return False, f"Skipped ({size_kb:.1f}KB < {min_kb}KB)"
+            
+            # Temporary check buffer memory me store karke memory corruption bypass karna
+            img_data = r.content
+            
+            # --- CORRUPTION CHECK FILTER ---
+            try:
+                # Pillow library se check karna ki image stream proper decode ho rahi hai ya nahi
+                check_img = PILImage.open(io.BytesIO(img_data))
+                check_img.verify()  # Integrity check execution
+            except (IOError, SyntaxError):
+                return False, "Corrupted Data Detected (Invalid JPEG Structure)"
+            
+            # Agar file validation pass kar jati hai tabhi disk me save karein
+            with open(save_path, 'wb') as f:
+                f.write(img_data)
+            return True, "Downloaded"
+        return False, f"HTTP Error {r.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+def process_single_loan(agreement_no, row_data, columns, min_kb, base_dir):
+    agreement_no = str(agreement_no).strip()
+    indian_offset = timezone(timedelta(hours=5, minutes=30))
+    timestamp = datetime.now(indian_offset).strftime("%d-%m-%Y %H:%M:%S")
+    
+    loan_folder = os.path.join(base_dir, agreement_no)
+    os.makedirs(loan_folder, exist_ok=True)
+    
+    session = requests.Session()
+    success_downloads = 0
+    failed_downloads = 0
+    details = []
+    
+    for col in columns:
+        url = row_data[col]
+        if pd.isna(url) or not str(url).startswith('http'):
+            continue
+            
+        img_url, err_msg = get_real_image_url(url, session)
+        if img_url:
+            clean_name = re.sub(r'[^a-zA-Z0-9_]', '', col.replace(" ", "_"))
+            save_path = os.path.join(loan_folder, f"{clean_name}.jpg")
+            
+            ok, status_str = download_and_verify(img_url, save_path, session, min_kb)
+            if ok:
+                success_downloads += 1
+            else:
+                failed_downloads += 1
+            details.append(f"{col}: {status_str}")
+        else:
+            failed_downloads += 1
+            details.append(f"{col}: Scrape error ({err_msg})")
+            
+    session.close()
+    
+    return {
+        "Agreement_No": agreement_no,
+        "Timestamp": timestamp,
+        "Total_Links_Processed": success_downloads + failed_downloads,
+        "Success_Downloads": success_downloads,
+        "Failed_Downloads": failed_downloads,
+        "Summary_Logs": " | ".join(details)
+    }
+
+# --- ENGINE FLOW ---
+if run_engine and uploaded_file is not None:
+    st.session_state.processing_complete = False
+    st.session_state.total_extracted = 0
+    st.session_state.success_count = 0
+    st.session_state.failure_count = 0
+    st.session_state.final_df_summary = None
+    
+    CURRENT_BATCH_DIR = os.path.abspath("TVS_Downloaded_Images")
+    if os.path.exists(CURRENT_BATCH_DIR):
+        import shutil
+        shutil.rmtree(CURRENT_BATCH_DIR)
+    os.makedirs(CURRENT_BATCH_DIR, exist_ok=True)
+    
+    try:
+        report_data = []
+        st.write("---")
+        st.markdown("### ⚙️ Processing Pipeline Logs")
+        
+        engine_progressbar = st.progress(0)
+        percentage_text = st.empty()  
+        completed_tasks = 0
+        
+        agreement_col = next((c for c in df.columns if c.upper() in ["AGREEMENT NO", "AGREEMENTNO", "LOAN NO"]), None)
+        
+        with st.status("Downloading Assets asynchronously...", expanded=True) as log_context:
+            workers = min(4, len(valid_rows)) if len(valid_rows) > 0 else 1
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_loan = {
+                    executor.submit(
+                        process_single_loan, row[agreement_col], row, link_columns, min_size_kb, CURRENT_BATCH_DIR
+                    ): row[agreement_col] for _, row in valid_rows.iterrows()
                 }
                 
-                car_folder = os.path.join(run_path, file_name)
-                os.makedirs(car_folder, exist_ok=True)
-                
-                if "autoinspekt.com" in primary_link:
-                    execute_autoinspekt_pipeline(primary_link, car_folder, status_entry)
-                elif "adroitauto.in" in primary_link or any(str(row.get(c, "")).startswith("http") for c in link_columns):
-                    execute_tvs_credit_pipeline(row, link_columns, car_folder, status_entry)
-                elif primary_link.startswith("http"):
-                    execute_selenium_headless_pipeline(primary_link, file_name, car_folder, status_entry)
-                else:
-                    status_entry["Pipeline Log Summary"] = "Skipped: Missing hypermedia pathway map"
-
-                report_data.append(status_entry)
-                progress_bar.progress((index + 1) / total_rows)
-
-            status_text.success("🏁 Pipeline Processing Run Completed Successfully!")
+                for future in as_completed(future_to_loan):
+                    loan_id = future_to_loan[future]
+                    try:
+                        res = future.result()
+                        completed_tasks += 1
+                        
+                        st.session_state.total_extracted += res["Success_Downloads"]
+                        if res["Success_Downloads"] > 0:
+                            st.session_state.success_count += 1
+                        else:
+                            st.session_state.failure_count += 1
+                            
+                        report_data.append(res)
+                        log_context.write(f"✅ **Done ({completed_tasks}/{total_loans_count}):** `{res['Agreement_No']}` -> Saved {res['Success_Downloads']} assets.")
+                    except Exception as e:
+                        completed_tasks += 1
+                        st.session_state.failure_count += 1
+                        log_context.write(f"🔴 **Crash Error on {loan_id}:** {e}")
+                        
+                    ratio = completed_tasks / total_loans_count
+                    percentage_text.markdown(f"**📊 Total Download Progress: {int(ratio * 100)}%**")
+                    engine_progressbar.progress(ratio)
+                    gc.collect()
             
+            log_context.update(label="🚀 Execution Completed Successfully!", state="complete", expanded=False)
+            
+        if report_data:
             report_df = pd.DataFrame(report_data)
-            report_excel_path = os.path.join(run_path, f"Global_Completion_Report_{timestamp}.xlsx")
-            report_df.to_excel(report_excel_path, index=False)
+            st.session_state.final_df_summary = report_df
+            report_df.to_csv(os.path.join(CURRENT_BATCH_DIR, "Batch_Download_Report.csv"), index=False)
             
-            st.markdown("### 📥 Download Processed Deliverables")
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for root, dirs, files in os.walk(run_path):
-                    for file in files:
-                        fp = os.path.join(root, file)
-                        rel_p = os.path.relpath(fp, run_path)
-                        zf.write(fp, rel_p)
+            master_zip = "TVS_Master_Package.zip"
+            with zipfile.ZipFile(master_zip, 'w', zipfile.ZIP_DEFLATED) as z:
+                for root, dirs, files in os.walk(CURRENT_BATCH_DIR):
+                    for f in files:
+                        full_p = os.path.join(root, f)
+                        z.write(full_p, os.path.relpath(full_p, CURRENT_BATCH_DIR))
             
-            st.download_button(
-                label="📥 DOWNLOAD ZIP ARCHIVE WITH COMPLETION REPORT",
-                data=zip_buffer.getvalue(),
-                file_name=f"Unified_Inspection_Package_{timestamp}.zip",
-                mime="application/zip",
-                use_container_width=True
-            )
+            st.balloons()
+            st.session_state.zip_name = master_zip
+            st.session_state.processing_complete = True
             
-            shutil.rmtree(run_path)
+    except Exception as outer_err:
+        st.error(f"Critical execution error: {outer_err}")
+
+# --- METRIC DASHBOARD OUTCOMES ---
+if st.session_state.processing_complete and os.path.exists(st.session_state.zip_name):
+    st.write("---")
+    st.markdown("### 🏁 Execution Dashboard Analytics")
+    
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.markdown(f'<div class="premium-card" style="border-bottom: 5px solid #10B981;"><span class="card-title">Success Loans</span><div class="card-value" style="color:#10B981;">{st.session_state.success_count}</div></div>', unsafe_allow_html=True)
+    with m2:
+        st.markdown(f'<div class="premium-card" style="border-bottom: 5px solid #EF4444;"><span class="card-title">Failed Loans</span><div class="card-value" style="color:#EF4444;">{st.session_state.failure_count}</div></div>', unsafe_allow_html=True)
+    with m3:
+        st.markdown(f'<div class="premium-card" style="border-bottom: 5px solid #F59E0B;"><span class="card-title">Total Extracted Images</span><div class="card-value" style="color:#F59E0B;">{st.session_state.total_extracted}</div></div>', unsafe_allow_html=True)
+        
+    tab_audit, tab_visuals = st.tabs(["📋 Process Log Report", "📊 Metrics Visualization"])
+    
+    with tab_audit:
+        if st.session_state.final_df_summary is not None:
+            st.dataframe(st.session_state.final_df_summary, use_container_width=True, hide_index=True)
+            
+    with tab_visuals:
+        health_chart_data = pd.DataFrame({
+            "Status": ["Success Pipeline", "Failed Pipeline"],
+            "Values": [st.session_state.success_count, st.session_state.failure_count]
+        })
+        st.data_editor(
+            health_chart_data,
+            column_config={
+                "Values": st.column_config.ProgressColumn(
+                    "Ratio Scale", format="%d", min_value=0, max_value=total_loans_count if total_loans_count > 0 else 10
+                ),
+            },
+            hide_index=True, use_container_width=True, key="metric_visual_editor"
+        )
+        
+    st.write(" ")
+    with open(st.session_state.zip_name, "rb") as fp:
+        indian_offset = timezone(timedelta(hours=5, minutes=30))
+        custom_name = f"TVS_Credit_Images_{datetime.now(indian_offset).strftime('%d-%m-%Y_%H-%M-%S')}.zip"
+        st.download_button(
+            label="📥 DOWNLOAD ZIP FILE AND COMPLETION REPORT",
+            data=fp,
+            file_name=custom_name,
+            mime="application/zip",
+            type="primary",
+            use_container_width=True
+        )
+
+st.markdown('<div class="footer-text">🛠️ TVS Credit Automated Pipeline Tool</div>', unsafe_allow_html=True)
