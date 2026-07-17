@@ -7,7 +7,7 @@ import shutil
 import zipfile
 import pandas as pd
 import requests
-import fitz  # PyMuPDF
+import fitz  # Provided cleanly by PyMuPDF
 import streamlit as st
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -54,7 +54,6 @@ def smart_get(url, retries=3):
 
 def process_pdf_bytes_to_images(content, folder):
     try:
-        # On Streamlit Cloud, poppler is installed globally via packages.txt, no path needed
         images = convert_from_bytes(content, dpi=200)
         for i, image in enumerate(images):
             filename = f"Z{str(i+1).zfill(3)}.jpg"
@@ -184,12 +183,11 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, status_entry
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     
-    # Secure execution preferences assigned explicitly to targeted workspace directories
     prefs = {
         "download.default_directory": os.path.abspath(car_folder),
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
-        "plugins.always_open_pdf_externally": True  # Force download instead of opening inside driver
+        "plugins.always_open_pdf_externally": True
     }
     options.add_experimental_option("prefs", prefs)
     
@@ -208,7 +206,6 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, status_entry
                 shutil.move(src_path, dest_path)
                 
                 if standardized_name.lower().endswith(".pdf"):
-                    # Scan internal page structures via PyMuPDF vector mapping
                     doc = fitz.open(dest_path)
                     download_url = None
                     for page in doc:
@@ -241,7 +238,6 @@ def execute_selenium_headless_pipeline(link, file_name, car_folder, status_entry
             extract_all_zips(car_folder)
             status_entry["ZIP Outcome"] = "Success"
         else:
-            # Interactive webpage tracking mode block
             driver.get(link)
             try:
                 btn = WebDriverWait(driver, 5).until(
@@ -284,7 +280,6 @@ if uploaded_file is not None:
     st.markdown("### 🔍 Uploaded Data Ingestion Preview")
     st.dataframe(df.head(5), use_container_width=True)
     
-    # Map layout arrays across column variances
     cols_upper = [str(c).upper() for c in df.columns]
     name_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["FILE NAME", "CAR/FILE NAME", "AGREEMENT NO", "LOAN NO"]), None)
     link_col = next((df.columns[i] for i, c in enumerate(cols_upper) if c in ["LINK", "INPUT LINK"]), None)
@@ -325,7 +320,6 @@ if uploaded_file is not None:
                 car_folder = os.path.join(run_path, file_name)
                 os.makedirs(car_folder, exist_ok=True)
                 
-                # 🔀 STRATEGIC ROUTING MATRIX
                 if "autoinspekt.com" in primary_link:
                     execute_autoinspekt_pipeline(primary_link, car_folder, status_entry)
                 elif "adroitauto.in" in primary_link or any(str(row.get(c, "")).startswith("http") for c in link_columns):
@@ -340,12 +334,10 @@ if uploaded_file is not None:
 
             status_text.success("🏁 Pipeline Processing Run Completed Successfully!")
             
-            # Save the execution evaluation ledger workbook
             report_df = pd.DataFrame(report_data)
             report_excel_path = os.path.join(run_path, f"Global_Completion_Report_{timestamp}.xlsx")
             report_df.to_excel(report_excel_path, index=False)
             
-            # Compress all generated subfolders safely in memory to yield one target download ZIP
             st.markdown("### 📥 Download Processed Deliverables")
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -363,5 +355,4 @@ if uploaded_file is not None:
                 use_container_width=True
             )
             
-            # Clean workspace directories locally on server container to prevent leakage boundaries
             shutil.rmtree(run_path)
