@@ -1,6 +1,8 @@
 streamlit
 pandas
 openpyxl
+requests
 beautifulsoup4
 Pillow
-curl_cffi
+urllib3
+cloudscraper
