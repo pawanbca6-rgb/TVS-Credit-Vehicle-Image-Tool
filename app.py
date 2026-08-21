@@ -2,7 +2,6 @@ import streamlit as st
 import time
 import os
 import re
-import requests
 import pandas as pd
 import gc
 import zipfile
@@ -12,9 +11,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from PIL import Image as PILImage
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import cloudscraper  # <-- Specialized library to bypass 403 Firewall/Cloudflare blocks
+from curl_cffi import requests as cffi_requests  # <-- Ultimate TLS spoofing library replacing cloudscraper/requests
 
 # --- STRICT SORTING ORDER CONFIGURATION (For Gallery Mode) ---
 DESIRED_ORDER = [
@@ -160,31 +157,21 @@ with st.sidebar:
         disabled=(uploaded_file is None)
     )
 
-# --- ADVANCED CLOUDSCRAPER ENGINE ---
+# --- ADVANCED CURL_CFFI ENGINE (100% Chrome Spoofing) ---
 def create_fast_session():
-    # Use cloudscraper to perfectly mimic a real Chrome browser and bypass Cloudflare/WAF 403 errors
-    session = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
-    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
+    # Impersonates Google Chrome to instantly bypass Data Center IP blocks and Cloudflare 403s
+    session = cffi_requests.Session(impersonate="chrome110")
     return session
 
 def download_and_verify(img_url, save_path, session, min_kb):
     try:
-        r = session.get(img_url, stream=True, timeout=15)
+        r = session.get(img_url, timeout=15)
         if r.status_code == 200:
-            content_length = r.headers.get('content-length')
-            if content_length and (int(content_length) / 1024) < min_kb:
+            img_data = r.content
+            content_length = len(img_data)
+            if content_length and (content_length / 1024) < min_kb:
                 return False, f"Skipped (<{min_kb}KB)"
             
-            img_data = r.content
             try:
                 check_img = PILImage.open(io.BytesIO(img_data))
                 check_img.verify()
@@ -204,7 +191,7 @@ def get_real_image_url(webpage_url, session):
         if response.status_code != 200:
             return None, f"HTTP Status {response.status_code}"
         
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.content, 'html.parser')
         img_tag = soup.find('img', id='imgDisplay')
         
         if img_tag and img_tag.get('src'):
@@ -228,7 +215,7 @@ def extract_gallery_images_only(url, col_name, session):
                 results.append((col_name, url))
             return results, "Success (Direct Image)"
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.content, 'html.parser')
         gallery_section = None
         for header in soup.find_all(['h2', 'h3', 'h4', 'div']):
             if 'vehicle gallery' in header.get_text(strip=True).lower():
@@ -340,8 +327,6 @@ def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
                 failed_downloads += 1
             details.append(f"{filename}: {status_str}")
 
-    session.close()
-    
     return {
         "Agreement_No": agreement_no,
         "Timestamp": timestamp,
