@@ -222,13 +222,13 @@ def extract_gallery_images_only(url, col_name, session):
     try:
         response = session.get(url, timeout=8)
         if response.status_code != 200:
-            return results
+            return results, f"HTTP Status {response.status_code}"
         
         content_type = response.headers.get('Content-Type', '')
         if 'image' in content_type:
             if not any(k in url.lower() for k in DISALLOWED_KEYWORDS):
                 results.append((col_name, url))
-            return results
+            return results, "Success (Direct Image)"
 
         soup = BeautifulSoup(response.text, 'html.parser')
         gallery_section = None
@@ -238,6 +238,9 @@ def extract_gallery_images_only(url, col_name, session):
                 break
 
         imgs_to_parse = gallery_section.find_all('img') if gallery_section else soup.find_all('img')
+        
+        if not imgs_to_parse:
+            return results, "No images found on page"
 
         for img in imgs_to_parse:
             src = img.get('src') or img.get('data-src')
@@ -261,9 +264,12 @@ def extract_gallery_images_only(url, col_name, session):
 
             results.append((label, full_src))
 
-    except Exception:
-        pass
-    return results
+        if not results:
+            return results, "Images found but rejected by keyword filter"
+            
+        return results, "Success"
+    except Exception as e:
+        return results, f"Scrape Error: {str(e)}"
 
 # --- AUTO-DETECT PIPELINE LOGIC ---
 def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
@@ -298,8 +304,12 @@ def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
                 details.append(f"{col}: Scrape error ({err_msg})")
                 
         elif 'mytvs.in' in url.lower():
-            extracted = extract_gallery_images_only(url, col, session)
-            gallery_raw.extend(extracted)
+            extracted, err_msg = extract_gallery_images_only(url, col, session)
+            if extracted:
+                gallery_raw.extend(extracted)
+            else:
+                failed_downloads += 1
+                details.append(f"{col}: Gallery Error ({err_msg})")
         else:
             details.append(f"{col}: Skipped unrecognized domain")
 
