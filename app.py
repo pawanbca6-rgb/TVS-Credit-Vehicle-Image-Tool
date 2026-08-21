@@ -4,15 +4,36 @@ import os
 import re
 import requests
 import pandas as pd
-import hashlib
 import gc
 import zipfile
 import io
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from PIL import Image as PILImage, ImageOps
+from PIL import Image as PILImage
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# --- STRICT SORTING ORDER CONFIGURATION (For Gallery Mode) ---
+DESIRED_ORDER = [
+    "Front Side", "Right Side", "Back Side", "Left Side", "Engine",
+    "Engine & Plate Photo", "Chassis Plate", "Odometer", "Dashboard",
+    "Seat", "Gear and Pedal", "Wind Shield", "All Boot", "Tyre 1",
+    "Tyre 2", "Tyre 3", "Tyre 4", "Chassis Number", "Chassis Print",
+    "Selfie with Vehicle", "RC Front"
+]
+
+DISALLOWED_KEYWORDS = ['score', 'qr', 'logo', 'icon', 'pdf', 'verified', 'badge', 'banner']
+
+def sanitize_name(name):
+    """Normalize label string for exact fuzzy matching."""
+    cleaned = re.sub(r'[^a-zA-Z0-9]', '', str(name)).lower()
+    if cleaned in ['repofront', 'front', 'frontimage', 'frontview']:
+        cleaned = 'frontside'
+    return cleaned
+
+ORDER_MAP = {sanitize_name(label): idx for idx, label in enumerate(DESIRED_ORDER, start=1)}
 
 # --- STATE INITIALIZATION ---
 if "processing_complete" not in st.session_state:
@@ -30,7 +51,7 @@ if "final_df_summary" not in st.session_state:
 
 # --- UI CONFIGURATION ---
 st.set_page_config(
-    page_title="TVS Credit Image Tool", 
+    page_title="TVS Auto-Detect Image Tool", 
     page_icon="📸",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -43,7 +64,7 @@ st.markdown("""
     .main-header { font-size: 34px; font-weight: 800; color: #1E3A8A; margin-bottom: 2px; }
     .metric-box { background-color: #F3F4F6; padding: 18px; border-radius: 10px; border-left: 6px solid #1E40AF; box-shadow: 0 2px 4px rgba(0,0,0,0.04); }
     .footer-text { text-align: center; font-size: 14px; color: #9CA3AF; margin-top: 50px; padding-top: 20px; border-top: 1px solid #E5E7EB; }
-    .note-box { background-color: #EFF6FF; color: #1E40AF; padding: 12px; border-radius: 6px; border-left: 4px solid #2563EB; margin-bottom: 15px; font-size: 14px; font-weight: 500; }
+    .note-box { background-color: #EFF6FF; color: #1E40AF; padding: 12px; border-radius: 6px; border-left: 4px solid #2563EB; margin-bottom: 8px; font-size: 14px; font-weight: 500; }
     .premium-card { background: #FFFFFF; padding: 24px; border-radius: 14px; border-bottom: 5px solid #CBD5E1; box-shadow: 0 4px 20px rgba(0,0,0,0.03); text-align: center; transition: transform 0.2s; }
     .premium-card:hover { transform: translateY(-2px); }
     .card-title { font-size: 12px; color: #64748B; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
@@ -66,8 +87,8 @@ with st.sidebar:
     
     sample_data = {
         "AGREEMENT NO": ["TN3006CA0024047", "TN3006TW0162293"],
-        "REPO FRONT": ["https://icms.tvscredit.com/...", "https://icms.tvscredit.com/..."],
-        "REPO REAR": ["https://icms.tvscredit.com/...", "https://icms.tvscredit.com/..."]
+        "VALUATION REPORT LINK": ["https://valuation.mytvs.in/report?id=13a2a6994376112354de7b0d85742fa32f0dd1e46a2", "https://valuation.mytvs.in/..."],
+        "REPO FRONT": ["https://icms.tvscredit.com/Vehical_Images.aspx?name=mp/PDqldk91V7nVmDsn3VILD3L/SbS46UDoYPLeo22UhsQS1N33B48Q7Cba2hOjb", "https://icms.tvscredit.com/..."]
     }
     sample_df = pd.DataFrame(sample_data)
     
@@ -85,16 +106,17 @@ with st.sidebar:
     st.write("---")
     
     st.markdown("##### ⚙️ Size Filter Configuration")
-    min_size_kb = st.number_input("Minimum Image Size Filter (KB):", min_value=0, value=50, step=50)
+    min_size_kb = st.number_input("Minimum Image Size Filter (KB):", min_value=0, value=10, step=10)
     st.write("---")
-    st.caption("Recommended: Run in batches of maximum 100 loans for best performance.")
+    st.caption("Recommended: Maximum 100 loans per batch for best execution speed.")
 
-st.markdown("## 📸 TVS Credit Vehicle Image Scraper Tool")
-st.markdown("""
-    <div class="note-box">
-        📌 <strong>This Tool extracts and categorizes dynamic vehicle images using secure scraping pathways.</strong>
-    </div>
-""", unsafe_allow_html=True)
+# --- MAIN UI HEADER ---
+st.markdown("## 📸 TVS Credit Unified Auto-Detect Tool")
+
+st.markdown('<div class="note-box">📌 <strong>This Tool Work Only For TVS Credit links.</strong></div>', unsafe_allow_html=True)
+st.markdown("🔗 **Sample Link Format 1 (Standard):** `https://icms.tvscredit.com/Vehical_Images.aspx?name=...`")
+st.markdown("🔗 **Sample Link Format 2 (Gallery):** `https://valuation.mytvs.in/report?id=...`")
+st.markdown("<br>", unsafe_allow_html=True)
 
 layout_left, layout_right = st.columns([2, 1])
 
@@ -109,11 +131,10 @@ link_columns = []
 
 if uploaded_file is not None:
     df = pd.read_excel(uploaded_file)
-    # Check flexible naming variations
     agreement_col = next((c for c in df.columns if c.upper() in ["AGREEMENT NO", "AGREEMENTNO", "LOAN NO"]), None)
     
     if not agreement_col:
-        st.error("❌ Column Validation Error: Sheet inside uploaded file must contain 'AGREEMENT NO' track header.")
+        st.error("❌ Column Validation Error: Sheet inside uploaded file must contain 'AGREEMENT NO' header.")
     else:
         valid_rows = df[df[agreement_col].notna()]
         total_loans_count = len(valid_rows)
@@ -143,14 +164,44 @@ with st.sidebar:
         disabled=(uploaded_file is None)
     )
 
-# --- CORE PARSING & PIPELINE FUNCTIONS ---
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+# --- CORE NETWORK & PARSING FUNCTIONS ---
+def create_fast_session():
+    session = requests.Session()
+    retries = Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    return session
 
+def download_and_verify(img_url, save_path, session, min_kb):
+    try:
+        r = session.get(img_url, stream=True, timeout=12)
+        if r.status_code == 200:
+            content_length = r.headers.get('content-length')
+            if content_length and (int(content_length) / 1024) < min_kb:
+                return False, f"Skipped (<{min_kb}KB)"
+            
+            img_data = r.content
+            try:
+                check_img = PILImage.open(io.BytesIO(img_data))
+                check_img.verify()
+            except (IOError, SyntaxError):
+                return False, "Corrupted Data"
+            
+            with open(save_path, 'wb') as f:
+                f.write(img_data)
+            return True, "Downloaded"
+        return False, f"HTTP Error {r.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+# --- SCRAPER LOGIC 1: ICMS TVS CREDIT ---
 def get_real_image_url(webpage_url, session):
     try:
-        response = session.get(webpage_url, headers=HEADERS, timeout=12)
+        response = session.get(webpage_url, timeout=12)
         if response.status_code != 200:
             return None, f"HTTP Status {response.status_code}"
         
@@ -165,36 +216,57 @@ def get_real_image_url(webpage_url, session):
     except Exception as e:
         return None, str(e)
 
-def download_and_verify(img_url, save_path, session, min_kb):
+# --- SCRAPER LOGIC 2: MYTVS GALLERY ---
+def extract_gallery_images_only(url, col_name, session):
+    results = []
     try:
-        r = session.get(img_url, headers=HEADERS, stream=True, timeout=15)
-        if r.status_code == 200:
-            content_length = r.headers.get('content-length')
-            if content_length:
-                size_kb = int(content_length) / 1024
-                if size_kb < min_kb:
-                    return False, f"Skipped ({size_kb:.1f}KB < {min_kb}KB)"
-            
-            # Temporary check buffer memory me store karke memory corruption bypass karna
-            img_data = r.content
-            
-            # --- CORRUPTION CHECK FILTER ---
-            try:
-                # Pillow library se check karna ki image stream proper decode ho rahi hai ya nahi
-                check_img = PILImage.open(io.BytesIO(img_data))
-                check_img.verify()  # Integrity check execution
-            except (IOError, SyntaxError):
-                return False, "Corrupted Data Detected (Invalid JPEG Structure)"
-            
-            # Agar file validation pass kar jati hai tabhi disk me save karein
-            with open(save_path, 'wb') as f:
-                f.write(img_data)
-            return True, "Downloaded"
-        return False, f"HTTP Error {r.status_code}"
-    except Exception as e:
-        return False, str(e)
+        response = session.get(url, timeout=8)
+        if response.status_code != 200:
+            return results
+        
+        content_type = response.headers.get('Content-Type', '')
+        if 'image' in content_type:
+            if not any(k in url.lower() for k in DISALLOWED_KEYWORDS):
+                results.append((col_name, url))
+            return results
 
-def process_single_loan(agreement_no, row_data, columns, min_kb, base_dir):
+        soup = BeautifulSoup(response.text, 'html.parser')
+        gallery_section = None
+        for header in soup.find_all(['h2', 'h3', 'h4', 'div']):
+            if 'vehicle gallery' in header.get_text(strip=True).lower():
+                gallery_section = header.find_parent(['section', 'div', 'main']) or header.parent
+                break
+
+        imgs_to_parse = gallery_section.find_all('img') if gallery_section else soup.find_all('img')
+
+        for img in imgs_to_parse:
+            src = img.get('src') or img.get('data-src')
+            if not src:
+                continue
+            
+            full_src = urljoin(url, src)
+            alt = img.get('alt', '').strip()
+            
+            check_str = f"{alt} {full_src}".lower()
+            if any(k in check_str for k in DISALLOWED_KEYWORDS):
+                continue
+
+            label = alt
+            if not label:
+                parent = img.find_parent()
+                if parent:
+                    label = parent.get_text(strip=True)
+            if not label:
+                label = col_name
+
+            results.append((label, full_src))
+
+    except Exception:
+        pass
+    return results
+
+# --- AUTO-DETECT PIPELINE LOGIC ---
+def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
     agreement_no = str(agreement_no).strip()
     indian_offset = timezone(timedelta(hours=5, minutes=30))
     timestamp = datetime.now(indian_offset).strftime("%d-%m-%Y %H:%M:%S")
@@ -202,31 +274,65 @@ def process_single_loan(agreement_no, row_data, columns, min_kb, base_dir):
     loan_folder = os.path.join(base_dir, agreement_no)
     os.makedirs(loan_folder, exist_ok=True)
     
-    session = requests.Session()
+    session = create_fast_session()
+    
     success_downloads = 0
     failed_downloads = 0
     details = []
     
+    standard_tasks = []
+    gallery_raw = []
+    
     for col in columns:
-        url = row_data[col]
-        if pd.isna(url) or not str(url).startswith('http'):
+        url = str(row_data[col]).strip()
+        if pd.isna(url) or not url.startswith('http'):
             continue
             
-        img_url, err_msg = get_real_image_url(url, session)
-        if img_url:
-            clean_name = re.sub(r'[^a-zA-Z0-9_]', '', col.replace(" ", "_"))
-            save_path = os.path.join(loan_folder, f"{clean_name}.jpg")
+        if 'icms.tvscredit.com' in url.lower():
+            img_url, err_msg = get_real_image_url(url, session)
+            if img_url:
+                clean_name = re.sub(r'[^a-zA-Z0-9_]', '', col.replace(" ", "_"))
+                standard_tasks.append((img_url, f"{clean_name}.jpg", col))
+            else:
+                failed_downloads += 1
+                details.append(f"{col}: Scrape error ({err_msg})")
+                
+        elif 'mytvs.in' in url.lower():
+            extracted = extract_gallery_images_only(url, col, session)
+            gallery_raw.extend(extracted)
+        else:
+            details.append(f"{col}: Skipped unrecognized domain")
+
+    for img_url, filename, col in standard_tasks:
+        save_path = os.path.join(loan_folder, filename)
+        ok, status_str = download_and_verify(img_url, save_path, session, min_kb)
+        if ok:
+            success_downloads += 1
+        else:
+            failed_downloads += 1
+        details.append(f"{col}: {status_str}")
+
+    if gallery_raw:
+        slot_allocations = {}
+        for label, img_url in gallery_raw:
+            clean_lbl = sanitize_name(label)
+            seq_num = ORDER_MAP.get(clean_lbl)
+            if seq_num and seq_num not in slot_allocations:
+                slot_allocations[seq_num] = (label, img_url)
+
+        for seq_num in sorted(slot_allocations.keys()):
+            label, img_url = slot_allocations[seq_num]
+            clean_title = DESIRED_ORDER[seq_num - 1]
+            filename = f"{seq_num}_{re.sub(r'[^a-zA-Z0-9_]', '', clean_title.replace(' ', '_'))}.jpg"
             
+            save_path = os.path.join(loan_folder, filename)
             ok, status_str = download_and_verify(img_url, save_path, session, min_kb)
             if ok:
                 success_downloads += 1
             else:
                 failed_downloads += 1
-            details.append(f"{col}: {status_str}")
-        else:
-            failed_downloads += 1
-            details.append(f"{col}: Scrape error ({err_msg})")
-            
+            details.append(f"{filename}: {status_str}")
+
     session.close()
     
     return {
@@ -263,12 +369,12 @@ if run_engine and uploaded_file is not None:
         
         agreement_col = next((c for c in df.columns if c.upper() in ["AGREEMENT NO", "AGREEMENTNO", "LOAN NO"]), None)
         
-        with st.status("Downloading Assets asynchronously...", expanded=True) as log_context:
-            workers = min(4, len(valid_rows)) if len(valid_rows) > 0 else 1
+        with st.status("Auto-Detecting URLs and Downloading Assets...", expanded=True) as log_context:
+            workers = min(10, len(valid_rows)) if len(valid_rows) > 0 else 1
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_to_loan = {
                     executor.submit(
-                        process_single_loan, row[agreement_col], row, link_columns, min_size_kb, CURRENT_BATCH_DIR
+                        process_loan_auto_detect, row[agreement_col], row, link_columns, min_size_kb, CURRENT_BATCH_DIR
                     ): row[agreement_col] for _, row in valid_rows.iterrows()
                 }
                 
@@ -289,7 +395,7 @@ if run_engine and uploaded_file is not None:
                     except Exception as e:
                         completed_tasks += 1
                         st.session_state.failure_count += 1
-                        log_context.write(f"🔴 **Crash Error on {loan_id}:** {e}")
+                        log_context.write(f"🔴 **Error on {loan_id}:** {e}")
                         
                     ratio = completed_tasks / total_loans_count
                     percentage_text.markdown(f"**📊 Total Download Progress: {int(ratio * 100)}%**")
@@ -354,7 +460,8 @@ if st.session_state.processing_complete and os.path.exists(st.session_state.zip_
     st.write(" ")
     with open(st.session_state.zip_name, "rb") as fp:
         indian_offset = timezone(timedelta(hours=5, minutes=30))
-        custom_name = f"TVS_Credit_Images_{datetime.now(indian_offset).strftime('%d-%m-%Y_%H-%M-%S')}.zip"
+        custom_name = f"TVS_Unified_Images_{datetime.now(indian_offset).strftime('%d-%m-%Y_%H-%M-%S')}.zip"
+        
         st.download_button(
             label="📥 DOWNLOAD ZIP FILE AND COMPLETION REPORT",
             data=fp,
