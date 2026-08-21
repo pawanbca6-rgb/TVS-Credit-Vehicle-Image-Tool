@@ -14,6 +14,7 @@ from PIL import Image as PILImage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import cloudscraper  # <-- Specialized library to bypass 403 Firewall/Cloudflare blocks
 
 # --- STRICT SORTING ORDER CONFIGURATION (For Gallery Mode) ---
 DESIRED_ORDER = [
@@ -27,7 +28,6 @@ DESIRED_ORDER = [
 DISALLOWED_KEYWORDS = ['score', 'qr', 'logo', 'icon', 'pdf', 'verified', 'badge', 'banner']
 
 def sanitize_name(name):
-    """Normalize label string for exact fuzzy matching."""
     cleaned = re.sub(r'[^a-zA-Z0-9]', '', str(name)).lower()
     if cleaned in ['repofront', 'front', 'frontimage', 'frontview']:
         cleaned = 'frontside'
@@ -69,7 +69,6 @@ st.markdown("""
     .premium-card:hover { transform: translateY(-2px); }
     .card-title { font-size: 12px; color: #64748B; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
     .card-value { font-size: 38px; font-weight: 800; margin-top: 8px; }
-    
     div[data-testid="stFileUploaderDropzoneInstructions"] small,
     div[data-testid="stFileUploaderDropzoneInstructions"] div,
     div[data-testid="stWidgetFormInstructions"],
@@ -110,9 +109,7 @@ with st.sidebar:
     st.write("---")
     st.caption("Recommended: Maximum 100 loans per batch for best execution speed.")
 
-# --- MAIN UI HEADER ---
 st.markdown("## 📸 TVS Credit Unified Auto-Detect Tool")
-
 st.markdown('<div class="note-box">📌 <strong>This Tool Work Only For TVS Credit links.</strong></div>', unsafe_allow_html=True)
 st.markdown("🔗 **Sample Link Format 1 (Standard):** `https://icms.tvscredit.com/Vehical_Images.aspx?name=...`")
 st.markdown("🔗 **Sample Link Format 2 (Gallery):** `https://valuation.mytvs.in/report?id=...`")
@@ -124,7 +121,6 @@ with layout_left:
     st.markdown("### 📂 File Upload")
     uploaded_file = st.file_uploader("Drop xlsx file here", type=["xlsx"], label_visibility="collapsed")
 
-# --- DATASET VALIDATION ---
 valid_rows = []
 total_loans_count = 0
 link_columns = []
@@ -164,33 +160,25 @@ with st.sidebar:
         disabled=(uploaded_file is None)
     )
 
-# --- CORE NETWORK & PARSING FUNCTIONS ---
+# --- ADVANCED CLOUDSCRAPER ENGINE ---
 def create_fast_session():
-    session = requests.Session()
+    # Use cloudscraper to perfectly mimic a real Chrome browser and bypass Cloudflare/WAF 403 errors
+    session = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
     retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
-    
-    # ADVANCED BROWSER HEADERS TO BYPASS 403 CLOUD BLOCKS
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0"
-    })
     return session
 
 def download_and_verify(img_url, save_path, session, min_kb):
     try:
-        r = session.get(img_url, stream=True, timeout=12)
+        r = session.get(img_url, stream=True, timeout=15)
         if r.status_code == 200:
             content_length = r.headers.get('content-length')
             if content_length and (int(content_length) / 1024) < min_kb:
@@ -210,10 +198,9 @@ def download_and_verify(img_url, save_path, session, min_kb):
     except Exception as e:
         return False, str(e)
 
-# --- SCRAPER LOGIC 1: ICMS TVS CREDIT ---
 def get_real_image_url(webpage_url, session):
     try:
-        response = session.get(webpage_url, timeout=12)
+        response = session.get(webpage_url, timeout=15)
         if response.status_code != 200:
             return None, f"HTTP Status {response.status_code}"
         
@@ -228,11 +215,10 @@ def get_real_image_url(webpage_url, session):
     except Exception as e:
         return None, str(e)
 
-# --- SCRAPER LOGIC 2: MYTVS GALLERY ---
 def extract_gallery_images_only(url, col_name, session):
     results = []
     try:
-        response = session.get(url, timeout=12)
+        response = session.get(url, timeout=15)
         if response.status_code != 200:
             return results, f"HTTP Status {response.status_code}"
         
@@ -283,7 +269,6 @@ def extract_gallery_images_only(url, col_name, session):
     except Exception as e:
         return results, f"Scrape Error: {str(e)}"
 
-# --- AUTO-DETECT PIPELINE LOGIC ---
 def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
     agreement_no = str(agreement_no).strip()
     indian_offset = timezone(timedelta(hours=5, minutes=30))
@@ -366,7 +351,6 @@ def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
         "Summary_Logs": " | ".join(details)
     }
 
-# --- ENGINE FLOW ---
 if run_engine and uploaded_file is not None:
     st.session_state.processing_complete = False
     st.session_state.total_extracted = 0
@@ -391,7 +375,7 @@ if run_engine and uploaded_file is not None:
         
         agreement_col = next((c for c in df.columns if c.upper() in ["AGREEMENT NO", "AGREEMENTNO", "LOAN NO"]), None)
         
-        with st.status("Auto-Detecting URLs and Downloading Assets...", expanded=True) as log_context:
+        with st.status("Auto-Detecting URLs and Bypassing Security...", expanded=True) as log_context:
             workers = min(10, len(valid_rows)) if len(valid_rows) > 0 else 1
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_to_loan = {
@@ -445,7 +429,6 @@ if run_engine and uploaded_file is not None:
     except Exception as outer_err:
         st.error(f"Critical execution error: {outer_err}")
 
-# --- METRIC DASHBOARD OUTCOMES ---
 if st.session_state.processing_complete and os.path.exists(st.session_state.zip_name):
     st.write("---")
     st.markdown("### 🏁 Execution Dashboard Analytics")
