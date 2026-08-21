@@ -24,7 +24,6 @@ DESIRED_ORDER = [
     "Selfie with Vehicle", "RC Front"
 ]
 
-# Explicit keywords to permanently ban non-vehicle graphics/logos
 DISALLOWED_KEYWORDS = ['score', 'qr', 'logo', 'icon', 'pdf', 'verified', 'badge', 'banner']
 
 def sanitize_name(name):
@@ -88,8 +87,8 @@ with st.sidebar:
     
     sample_data = {
         "AGREEMENT NO": ["TN3006CA0024047", "TN3006TW0162293"],
-        "VALUATION REPORT LINK": ["https://valuation.mytvs.in/report?id=13a2a...", "https://valuation.mytvs.in/..."],
-        "REPO FRONT": ["https://icms.tvscredit.com/...", "https://icms.tvscredit.com/..."]
+        "VALUATION REPORT LINK": ["https://valuation.mytvs.in/report?id=13a2a6994376112354de7b0d85742fa32f0dd1e46a2", "https://valuation.mytvs.in/..."],
+        "REPO FRONT": ["https://icms.tvscredit.com/Vehical_Images.aspx?name=mp/PDqldk91V7nVmDsn3VILD3L/SbS46UDoYPLeo22UhsQS1N33B48Q7Cba2hOjb", "https://icms.tvscredit.com/..."]
     }
     sample_df = pd.DataFrame(sample_data)
     
@@ -114,9 +113,8 @@ with st.sidebar:
 # --- MAIN UI HEADER ---
 st.markdown("## 📸 TVS Credit Unified Auto-Detect Tool")
 
-# Custom Banner & Sample Link Format
-st.markdown('<div class="note-box">📌 <strong>This Tool Work Only For TVS Credit links (icms & mytvs domains).</strong></div>', unsafe_allow_html=True)
-st.markdown("🔗 **Sample Link Format 1 (Standard):** `https://icms.tvscredit.com/Vehical_Images...`")
+st.markdown('<div class="note-box">📌 <strong>This Tool Work Only For TVS Credit links.</strong></div>', unsafe_allow_html=True)
+st.markdown("🔗 **Sample Link Format 1 (Standard):** `https://icms.tvscredit.com/Vehical_Images.aspx?name=...`")
 st.markdown("🔗 **Sample Link Format 2 (Gallery):** `https://valuation.mytvs.in/report?id=...`")
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -187,7 +185,6 @@ def download_and_verify(img_url, save_path, session, min_kb):
                 return False, f"Skipped (<{min_kb}KB)"
             
             img_data = r.content
-            
             try:
                 check_img = PILImage.open(io.BytesIO(img_data))
                 check_img.verify()
@@ -234,7 +231,6 @@ def extract_gallery_images_only(url, col_name, session):
             return results
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        
         gallery_section = None
         for header in soup.find_all(['h2', 'h3', 'h4', 'div']):
             if 'vehicle gallery' in header.get_text(strip=True).lower():
@@ -284,7 +280,6 @@ def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
     failed_downloads = 0
     details = []
     
-    # Store standard downloads and gallery raw links separately
     standard_tasks = []
     gallery_raw = []
     
@@ -293,7 +288,6 @@ def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
         if pd.isna(url) or not url.startswith('http'):
             continue
             
-        # Detect Domain dynamically
         if 'icms.tvscredit.com' in url.lower():
             img_url, err_msg = get_real_image_url(url, session)
             if img_url:
@@ -306,12 +300,9 @@ def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
         elif 'mytvs.in' in url.lower():
             extracted = extract_gallery_images_only(url, col, session)
             gallery_raw.extend(extracted)
-            
         else:
-            # Skip unrecognized domains or handle them
             details.append(f"{col}: Skipped unrecognized domain")
 
-    # 1. Download Standard ICMS Links
     for img_url, filename, col in standard_tasks:
         save_path = os.path.join(loan_folder, filename)
         ok, status_str = download_and_verify(img_url, save_path, session, min_kb)
@@ -321,13 +312,11 @@ def process_loan_auto_detect(agreement_no, row_data, columns, min_kb, base_dir):
             failed_downloads += 1
         details.append(f"{col}: {status_str}")
 
-    # 2. Process and Download MyTVS Gallery Links with Slot Deduplication
     if gallery_raw:
         slot_allocations = {}
         for label, img_url in gallery_raw:
             clean_lbl = sanitize_name(label)
             seq_num = ORDER_MAP.get(clean_lbl)
-            
             if seq_num and seq_num not in slot_allocations:
                 slot_allocations[seq_num] = (label, img_url)
 
