@@ -87,8 +87,8 @@ with st.sidebar:
     
     sample_data = {
         "AGREEMENT NO": ["TN3006CA0024047", "TN3006TW0162293"],
-        "VALUATION REPORT LINK": ["https://valuation.mytvs.in/report?id=13a2a6994376112354de7b0d85742fa32f0dd1e46a2", "https://valuation.mytvs.in/..."],
-        "REPO FRONT": ["https://icms.tvscredit.com/Vehical_Images.aspx?name=mp/PDqldk91V7nVmDsn3VILD3L/SbS46UDoYPLeo22UhsQS1N33B48Q7Cba2hOjb", "https://icms.tvscredit.com/..."]
+        "VALUATION REPORT LINK": ["https://valuation.mytvs.in/report?id=13a2a699...", "https://valuation.mytvs.in/..."],
+        "REPO FRONT": ["https://icms.tvscredit.com/Vehical_Images.aspx?name=...", "https://icms.tvscredit.com/..."]
     }
     sample_df = pd.DataFrame(sample_data)
     
@@ -167,12 +167,24 @@ with st.sidebar:
 # --- CORE NETWORK & PARSING FUNCTIONS ---
 def create_fast_session():
     session = requests.Session()
-    retries = Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
+    
+    # ADVANCED BROWSER HEADERS TO BYPASS 403 CLOUD BLOCKS
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0"
     })
     return session
 
@@ -220,7 +232,7 @@ def get_real_image_url(webpage_url, session):
 def extract_gallery_images_only(url, col_name, session):
     results = []
     try:
-        response = session.get(url, timeout=8)
+        response = session.get(url, timeout=12)
         if response.status_code != 200:
             return results, f"HTTP Status {response.status_code}"
         
