@@ -5,3 +5,4 @@ requests
 beautifulsoup4
 Pillow
 urllib3
+cloudscraper
